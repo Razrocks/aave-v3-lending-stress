@@ -1,0 +1,42 @@
+WITH top_assets AS (
+    SELECT
+        s.reserve                                                            AS asset,
+        t.symbol,
+        t.decimals,
+        SUM(CAST(s.amount AS DOUBLE) / POWER(10, t.decimals) * p.price)     AS supply_usd_30d
+    FROM aave_v3_ethereum.Pool_evt_Supply s
+    LEFT JOIN tokens.erc20 t
+        ON t.blockchain = 'ethereum'
+        AND t.contract_address = s.reserve
+    LEFT JOIN prices.day p
+        ON p.blockchain = 'ethereum'
+        AND p.contract_address = s.reserve
+        AND p.timestamp = DATE_TRUNC('day', s.evt_block_time)
+    WHERE s.evt_block_time >= NOW() - INTERVAL '30' DAY
+    GROUP BY s.reserve, t.symbol, t.decimals
+    ORDER BY supply_usd_30d DESC
+    LIMIT 15
+),
+
+weekly_supply AS (
+    SELECT
+        DATE_TRUNC('week', s.evt_block_time)                                AS week,
+        ta.symbol                                                            AS asset,
+        SUM(CAST(s.amount AS DOUBLE) / POWER(10, ta.decimals) * p.price)    AS supply_usd
+    FROM aave_v3_ethereum.Pool_evt_Supply s
+    INNER JOIN top_assets ta
+        ON ta.asset = s.reserve
+    LEFT JOIN prices.day p
+        ON p.blockchain = 'ethereum'
+        AND p.contract_address = s.reserve
+        AND p.timestamp = DATE_TRUNC('day', s.evt_block_time)
+    WHERE s.evt_block_time >= TIMESTAMP '2024-01-01'
+    GROUP BY DATE_TRUNC('week', s.evt_block_time), ta.symbol
+)
+
+SELECT
+    week,
+    asset,
+    COALESCE(supply_usd, 0) AS supply_usd
+FROM weekly_supply
+ORDER BY week, asset

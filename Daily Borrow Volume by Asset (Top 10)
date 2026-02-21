@@ -1,0 +1,33 @@
+WITH top_assets AS (
+    SELECT
+        b.reserve                                                            AS asset,
+        t.symbol,
+        t.decimals
+    FROM aave_v3_ethereum.Pool_evt_Borrow b
+    LEFT JOIN tokens.erc20 t
+        ON t.blockchain = 'ethereum'
+        AND t.contract_address = b.reserve
+    LEFT JOIN prices.day p
+        ON p.blockchain = 'ethereum'
+        AND p.contract_address = b.reserve
+        AND p.timestamp = DATE_TRUNC('day', b.evt_block_time)
+    WHERE b.evt_block_time >= NOW() - INTERVAL '30' DAY
+    GROUP BY b.reserve, t.symbol, t.decimals
+    ORDER BY SUM(CAST(b.amount AS DOUBLE) / POWER(10, t.decimals) * p.price) DESC
+    LIMIT 10
+)
+
+SELECT
+    DATE_TRUNC('day', b.evt_block_time)                                      AS day,
+    ta.symbol                                                                 AS asset,
+    SUM(CAST(b.amount AS DOUBLE) / POWER(10, ta.decimals) * p.price)         AS borrow_usd
+FROM aave_v3_ethereum.Pool_evt_Borrow b
+INNER JOIN top_assets ta
+    ON ta.asset = b.reserve
+LEFT JOIN prices.day p
+    ON p.blockchain = 'ethereum'
+    AND p.contract_address = b.reserve
+    AND p.timestamp = DATE_TRUNC('day', b.evt_block_time)
+WHERE b.evt_block_time >= TIMESTAMP '2024-01-01'
+GROUP BY 1, 2
+ORDER BY 1, 2

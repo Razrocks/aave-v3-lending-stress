@@ -1,0 +1,26 @@
+WITH liq_raw AS (
+    SELECT
+        DATE_TRUNC('day', l.evt_block_time)                              AS day,
+        l.evt_tx_hash,
+        l.user,
+        CAST(l.debtToCover AS DOUBLE) / POWER(10, t.decimals) * p.price  AS debt_usd
+    FROM aave_v3_ethereum.Pool_evt_LiquidationCall l
+    LEFT JOIN tokens.erc20 t
+        ON t.blockchain = 'ethereum'
+        AND t.contract_address = l.debtAsset
+    LEFT JOIN prices.day p
+        ON p.blockchain = 'ethereum'
+        AND p.contract_address = l.debtAsset
+        AND p.timestamp = DATE_TRUNC('day', l.evt_block_time)
+    WHERE l.evt_block_time >= TIMESTAMP '2024-01-01'
+)
+
+SELECT
+    day,
+    COALESCE(SUM(debt_usd), 0)      AS liquidations_usd,
+    COUNT(*)                          AS tx_count,
+    COUNT(DISTINCT user)              AS unique_users
+FROM liq_raw
+GROUP BY day
+ORDER BY liquidations_usd DESC
+LIMIT 20

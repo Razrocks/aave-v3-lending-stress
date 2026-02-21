@@ -1,0 +1,30 @@
+SELECT
+    l.evt_block_time                                                                     AS block_time,
+    l.evt_tx_hash                                                                        AS tx_hash,
+    l.user,
+    td.symbol                                                                            AS debt_asset_symbol,
+    tc.symbol                                                                            AS collateral_asset_symbol,
+    CAST(l.debtToCover AS DOUBLE) / POWER(10, td.decimals) * pd.price                   AS debt_usd,
+    CAST(l.liquidatedCollateralAmount AS DOUBLE) / POWER(10, tc.decimals)                AS collateral_amount,
+    CAST(l.liquidatedCollateralAmount AS DOUBLE) / POWER(10, tc.decimals) * pc.price     AS collateral_usd,
+    l.liquidator
+FROM aave_v3_ethereum.Pool_evt_LiquidationCall l
+-- debt token metadata + price
+LEFT JOIN tokens.erc20 td
+    ON td.blockchain = 'ethereum'
+    AND td.contract_address = l.debtAsset
+LEFT JOIN prices.day pd
+    ON pd.blockchain = 'ethereum'
+    AND pd.contract_address = l.debtAsset
+    AND pd.timestamp = DATE_TRUNC('day', l.evt_block_time)
+-- collateral token metadata + price
+LEFT JOIN tokens.erc20 tc
+    ON tc.blockchain = 'ethereum'
+    AND tc.contract_address = l.collateralAsset
+LEFT JOIN prices.day pc
+    ON pc.blockchain = 'ethereum'
+    AND pc.contract_address = l.collateralAsset
+    AND pc.timestamp = DATE_TRUNC('day', l.evt_block_time)
+WHERE l.evt_block_time >= TIMESTAMP '2024-01-01'
+ORDER BY debt_usd DESC
+LIMIT 50

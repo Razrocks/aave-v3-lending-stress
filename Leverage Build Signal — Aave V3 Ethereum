@@ -1,0 +1,147 @@
+WITH daily_borrow AS (
+    SELECT
+        DATE_TRUNC('day', b.evt_block_time)                              AS day,
+        SUM(CAST(b.amount AS DOUBLE) / POWER(10, t.decimals) * p.price)  AS borrow_usd
+    FROM aave_v3_ethereum.Pool_evt_Borrow b
+    LEFT JOIN tokens.erc20 t
+        ON t.blockchain = 'ethereum'
+        AND t.contract_address = b.reserve
+    LEFT JOIN prices.day p
+        ON p.blockchain = 'ethereum'
+        AND p.contract_address = b.reserve
+        AND p.timestamp = DATE_TRUNC('day', b.evt_block_time)
+    WHERE b.evt_block_time >= TIMESTAMP '2023-12-01'
+    GROUP BY 1
+),
+
+borrow_rolling AS (
+    SELECT
+        day,
+        SUM(borrow_usd) OVER (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)   AS borrow_7d,
+        SUM(borrow_usd) OVER (ORDER BY day ROWS BETWEEN 13 PRECEDING AND 7 PRECEDING)  AS borrow_prev_7d
+    FROM daily_borrow
+),
+
+borrow_growth AS (
+    SELECT
+        day,
+        borrow_7d,
+        borrow_prev_7d,
+        CASE
+            WHEN borrow_prev_7d > 0
+            THEN (borrow_7d - borrow_prev_7d) / borrow_prev_7d
+            ELSE 0
+        END AS borrow_growth_7d
+    FROM borrow_rolling
+),
+
+-- Whitelist: "safe" / high-quality collateral
+safe_collateral (address) AS (
+    VALUES
+        (0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2),  -- WETH
+        (0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0),  -- wstETH
+        (0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48),  -- USDC
+        (0xdAC17F958D2ee523a2206206994597C13D831ec7),  -- USDT
+        (0x6B175474E89094C44Da98b954EedeAC495271d0F),  -- DAI
+        (0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599)   -- WBTC
+),
+
+daily_liq AS (
+    SELECT
+        DATE_TRUNC('day', l.evt_block_time) AS day,
+        CAST(l.liquidatedCollateralAmount AS DOUBLE) / POWER(10, tc.decimals) * pc.price
+            AS collateral_usd,
+        CASE
+            WHEN l.collateralAsset NOT IN (SELECT address FROM safe_collateral)
+            THEN CAST(l.liquidatedCollateralAmount AS DOUBLE) / POWER(10, tc.decimals) * pc.price
+            ELSE 0
+        END AS risk_collateral_usd
+    FROM aave_v3_ethereum.Pool_evt_LiquidationCall l
+    LEFT JOIN tokens.erc20 tc
+        ON tc.blockchain = 'ethereum'
+        AND tc.contract_address = l.collateralAsset
+    LEFT JOIN prices.day pc
+        ON pc.blockchain = 'ethereum'
+        AND pc.contract_address = l.collateralAsset
+        AND pc.timestamp = DATE_TRUNC('day', l.evt_block_time)
+    WHERE l.evt_block_time >= TIMESTAMP '2023-12-01'
+),
+
+daily_liq_agg AS (
+    SELECT
+        day,
+        SUM(collateral_usd)      AS collateral_usd,
+        SUM(risk_collateral_usd) AS risk_collateral_usd
+    FROM daily_liq
+    GROUP BY day
+),
+
+liq_rolling AS (
+    SELECT
+        day,
+        SUM(collateral_usd)      OVER (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS total_collateral_7d,
+        SUM(risk_collateral_usd) OVER (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS risk_collateral_7d
+    FROM daily_liq_agg
+),
+
+risk_share AS (
+    SELECT
+        day,
+        CASE
+            WHEN total_collateral_7d > 0
+            THEN risk_collateral_7d / total_collateral_7d
+            ELSE 0
+        END AS risk_collateral_share
+    FROM liq_rolling
+),
+
+-- Combine borrow growth + risk collateral share
+combined AS (
+    SELECT
+        bg.day,
+        bg.borrow_growth_7d,
+        COALESCE(rs.risk_collateral_share, 0) AS risk_collateral_share
+    FROM borrow_growth bg
+    LEFT JOIN risk_share rs ON bg.day = rs.day
+    WHERE bg.day >= TIMESTAMP '2024-01-01'
+),
+
+-- Min-max scaling over the 180D window
+scaling AS (
+    SELECT
+        MIN(borrow_growth_7d)      AS bg_min,
+        MAX(borrow_growth_7d)      AS bg_max,
+        MIN(risk_collateral_share) AS rc_min,
+        MAX(risk_collateral_share) AS rc_max
+    FROM combined
+)
+
+SELECT
+    c.day,
+    c.borrow_growth_7d,
+    c.risk_collateral_share,
+
+    -- Signal: sum of two min-max scaled components (range 0–2)
+    CASE WHEN s.bg_max > s.bg_min
+         THEN (c.borrow_growth_7d - s.bg_min) / (s.bg_max - s.bg_min)
+         ELSE 0 END
+    +
+    CASE WHEN s.rc_max > s.rc_min
+         THEN (c.risk_collateral_share - s.rc_min) / (s.rc_max - s.rc_min)
+         ELSE 0 END
+    AS signal,
+
+    -- Flag: fires when signal > 1.5 (tunable threshold)
+    CASE WHEN
+        (CASE WHEN s.bg_max > s.bg_min
+              THEN (c.borrow_growth_7d - s.bg_min) / (s.bg_max - s.bg_min)
+              ELSE 0 END
+         +
+         CASE WHEN s.rc_max > s.rc_min
+              THEN (c.risk_collateral_share - s.rc_min) / (s.rc_max - s.rc_min)
+              ELSE 0 END) > 0.75
+    THEN 1 ELSE 0 END AS signal_flag
+
+FROM combined c
+CROSS JOIN scaling s
+ORDER BY c.day

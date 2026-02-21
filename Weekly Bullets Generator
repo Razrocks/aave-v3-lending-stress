@@ -1,0 +1,163 @@
+WITH
+-- 7D liquidation volume
+liq_7d AS (
+    SELECT COALESCE(SUM(
+        CAST(l.debtToCover AS DOUBLE) / POWER(10, t.decimals) * p.price
+    ), 0) AS val
+    FROM aave_v3_ethereum.Pool_evt_LiquidationCall l
+    LEFT JOIN tokens.erc20 t
+        ON t.blockchain = 'ethereum' AND t.contract_address = l.debtAsset
+    LEFT JOIN prices.day p
+        ON p.blockchain = 'ethereum' AND p.contract_address = l.debtAsset
+        AND p.timestamp = DATE_TRUNC('day', l.evt_block_time)
+    WHERE l.evt_block_time >= NOW() - INTERVAL '7' DAY
+),
+
+-- Previous 7D liquidation volume (for WoW)
+liq_prev_7d AS (
+    SELECT COALESCE(SUM(
+        CAST(l.debtToCover AS DOUBLE) / POWER(10, t.decimals) * p.price
+    ), 0) AS val
+    FROM aave_v3_ethereum.Pool_evt_LiquidationCall l
+    LEFT JOIN tokens.erc20 t
+        ON t.blockchain = 'ethereum' AND t.contract_address = l.debtAsset
+    LEFT JOIN prices.day p
+        ON p.blockchain = 'ethereum' AND p.contract_address = l.debtAsset
+        AND p.timestamp = DATE_TRUNC('day', l.evt_block_time)
+    WHERE l.evt_block_time >= NOW() - INTERVAL '14' DAY
+      AND l.evt_block_time <  NOW() - INTERVAL '7' DAY
+),
+
+-- Top 3 most-borrowed assets trailing 7D
+top_borrow AS (
+    SELECT
+        t.symbol,
+        SUM(CAST(b.amount AS DOUBLE) / POWER(10, t.decimals) * p.price) AS borrow_usd
+    FROM aave_v3_ethereum.Pool_evt_Borrow b
+    LEFT JOIN tokens.erc20 t
+        ON t.blockchain = 'ethereum' AND t.contract_address = b.reserve
+    LEFT JOIN prices.day p
+        ON p.blockchain = 'ethereum' AND p.contract_address = b.reserve
+        AND p.timestamp = DATE_TRUNC('day', b.evt_block_time)
+    WHERE b.evt_block_time >= NOW() - INTERVAL '7' DAY
+    GROUP BY t.symbol
+    ORDER BY borrow_usd DESC
+    LIMIT 3
+),
+
+-- Largest single liquidation tx in 7D
+biggest_liq AS (
+    SELECT
+        l.evt_block_time AS ts,
+        CAST(l.debtToCover AS DOUBLE) / POWER(10, t.decimals) * p.price AS debt_usd
+    FROM aave_v3_ethereum.Pool_evt_LiquidationCall l
+    LEFT JOIN tokens.erc20 t
+        ON t.blockchain = 'ethereum' AND t.contract_address = l.debtAsset
+    LEFT JOIN prices.day p
+        ON p.blockchain = 'ethereum' AND p.contract_address = l.debtAsset
+        AND p.timestamp = DATE_TRUNC('day', l.evt_block_time)
+    WHERE l.evt_block_time >= NOW() - INTERVAL '7' DAY
+    ORDER BY debt_usd DESC
+    LIMIT 1
+),
+
+-- 7D borrow volume
+borrow_7d AS (
+    SELECT COALESCE(SUM(
+        CAST(b.amount AS DOUBLE) / POWER(10, t.decimals) * p.price
+    ), 0) AS val
+    FROM aave_v3_ethereum.Pool_evt_Borrow b
+    LEFT JOIN tokens.erc20 t
+        ON t.blockchain = 'ethereum' AND t.contract_address = b.reserve
+    LEFT JOIN prices.day p
+        ON p.blockchain = 'ethereum' AND p.contract_address = b.reserve
+        AND p.timestamp = DATE_TRUNC('day', b.evt_block_time)
+    WHERE b.evt_block_time >= NOW() - INTERVAL '7' DAY
+),
+
+-- Previous 7D borrow volume (for WoW)
+borrow_prev_7d AS (
+    SELECT COALESCE(SUM(
+        CAST(b.amount AS DOUBLE) / POWER(10, t.decimals) * p.price
+    ), 0) AS val
+    FROM aave_v3_ethereum.Pool_evt_Borrow b
+    LEFT JOIN tokens.erc20 t
+        ON t.blockchain = 'ethereum' AND t.contract_address = b.reserve
+    LEFT JOIN prices.day p
+        ON p.blockchain = 'ethereum' AND p.contract_address = b.reserve
+        AND p.timestamp = DATE_TRUNC('day', b.evt_block_time)
+    WHERE b.evt_block_time >= NOW() - INTERVAL '14' DAY
+      AND b.evt_block_time <  NOW() - INTERVAL '7' DAY
+)
+
+-- Bullet 1: Liquidation volume WoW
+SELECT 1 AS sort_order,
+    CONCAT(
+        '7D liquidation volume: $',
+        FORMAT('%,.0f', l.val),
+        ' (',
+        CASE WHEN lp.val > 0 THEN
+            CONCAT(
+                CASE WHEN l.val >= lp.val THEN 'up ' ELSE 'down ' END,
+                FORMAT('%.1f', ABS((l.val - lp.val) / lp.val) * 100),
+                '% WoW'
+            )
+        ELSE 'no prior week data'
+        END,
+        ')'
+    ) AS bullet
+FROM liq_7d l, liq_prev_7d lp
+
+UNION ALL
+
+-- Bullet 2: Most borrowed assets
+SELECT 2,
+    CONCAT('Most borrowed assets (7D): ',
+        ARRAY_JOIN(ARRAY_AGG(tb.symbol ORDER BY tb.borrow_usd DESC), ', '))
+FROM top_borrow tb
+
+UNION ALL
+
+-- Bullet 3: Largest single liquidation
+SELECT 3,
+    CONCAT('Largest liquidation (7D): $',
+        FORMAT('%,.0f', COALESCE(bl.debt_usd, 0)),
+        ' on ',
+        CAST(DATE(bl.ts) AS VARCHAR))
+FROM biggest_liq bl
+
+UNION ALL
+
+-- Bullet 4: Borrow volume WoW
+SELECT 4,
+    CONCAT('7D borrow volume: $',
+        FORMAT('%,.0f', b7.val),
+        ' (',
+        CASE WHEN bp.val > 0 THEN
+            CONCAT(
+                CASE WHEN b7.val >= bp.val THEN 'up ' ELSE 'down ' END,
+                FORMAT('%.1f', ABS((b7.val - bp.val) / bp.val) * 100),
+                '% WoW')
+        ELSE 'no prior week data'
+        END,
+        ')'
+    )
+FROM borrow_7d b7, borrow_prev_7d bp
+
+UNION ALL
+
+-- Bullet 5: Leverage signal status
+SELECT 5,
+    CONCAT('Leverage signal: ',
+        CASE WHEN b7.val > 0 AND bp.val > 0 AND (b7.val - bp.val) / bp.val > 0.1
+            THEN 'ELEVATED'
+            ELSE 'NORMAL'
+        END,
+        ' (borrow growth: ',
+        CASE WHEN bp.val > 0
+            THEN FORMAT('%.1f', (b7.val - bp.val) / bp.val * 100)
+            ELSE '0' END,
+        '%)')
+FROM borrow_7d b7, borrow_prev_7d bp
+
+ORDER BY sort_order
