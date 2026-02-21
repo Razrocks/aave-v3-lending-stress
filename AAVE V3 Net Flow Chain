@@ -1,0 +1,95 @@
+WITH all_flows AS (
+    -- ETHEREUM: Supply (+)
+    SELECT
+        'Ethereum' AS chain,
+        DATE_TRUNC('day', evt_block_time) AS day,
+        reserve,
+        CAST(amount AS DOUBLE) AS raw_amount
+    FROM aave_v3_ethereum.Pool_evt_Supply
+    WHERE evt_block_time >= TIMESTAMP '2024-01-01'
+
+    UNION ALL
+
+    -- ETHEREUM: Withdraw (-)
+    SELECT
+        'Ethereum' AS chain,
+        DATE_TRUNC('day', evt_block_time) AS day,
+        reserve,
+        -CAST(amount AS DOUBLE) AS raw_amount
+    FROM aave_v3_ethereum.Pool_evt_Withdraw
+    WHERE evt_block_time >= TIMESTAMP '2024-01-01'
+
+    UNION ALL
+
+    -- OTHER CHAINS: Supply (+)
+    SELECT
+        CASE
+            WHEN chain = 'arbitrum' THEN 'Arbitrum'
+            WHEN chain = 'polygon' THEN 'Polygon'
+            WHEN chain = 'optimism' THEN 'Optimism'
+            WHEN chain = 'base' THEN 'Base'
+            WHEN chain = 'avalanche_c' THEN 'Avalanche'
+        END AS chain,
+        DATE_TRUNC('day', evt_block_time) AS day,
+        reserve,
+        CAST(amount AS DOUBLE) AS raw_amount
+    FROM aave_v3_multichain.Pool_evt_Supply
+    WHERE chain IN ('arbitrum', 'polygon', 'optimism', 'base', 'avalanche_c')
+      AND evt_block_time >= TIMESTAMP '2024-01-01'
+
+    UNION ALL
+
+    -- OTHER CHAINS: Withdraw (-)
+    SELECT
+        CASE
+            WHEN chain = 'arbitrum' THEN 'Arbitrum'
+            WHEN chain = 'polygon' THEN 'Polygon'
+            WHEN chain = 'optimism' THEN 'Optimism'
+            WHEN chain = 'base' THEN 'Base'
+            WHEN chain = 'avalanche_c' THEN 'Avalanche'
+        END AS chain,
+        DATE_TRUNC('day', evt_block_time) AS day,
+        reserve,
+        -CAST(amount AS DOUBLE) AS raw_amount
+    FROM aave_v3_multichain.Pool_evt_Withdraw
+    WHERE chain IN ('arbitrum', 'polygon', 'optimism', 'base', 'avalanche_c')
+      AND evt_block_time >= TIMESTAMP '2024-01-01'
+),
+
+daily_net AS (
+    SELECT
+        f.chain,
+        f.day,
+        SUM(f.raw_amount / POWER(10, t.decimals) * p.price) AS net_flow_usd
+    FROM all_flows f
+    LEFT JOIN tokens.erc20 t
+        ON t.contract_address = f.reserve
+        AND t.blockchain = CASE
+            WHEN f.chain = 'Ethereum'  THEN 'ethereum'
+            WHEN f.chain = 'Arbitrum'  THEN 'arbitrum'
+            WHEN f.chain = 'Polygon'   THEN 'polygon'
+            WHEN f.chain = 'Optimism'  THEN 'optimism'
+            WHEN f.chain = 'Base'      THEN 'base'
+            WHEN f.chain = 'Avalanche' THEN 'avalanche_c'
+        END
+    LEFT JOIN prices.day p
+        ON p.contract_address = f.reserve
+        AND p.timestamp = f.day
+        AND p.blockchain = CASE
+            WHEN f.chain = 'Ethereum'  THEN 'ethereum'
+            WHEN f.chain = 'Arbitrum'  THEN 'arbitrum'
+            WHEN f.chain = 'Polygon'   THEN 'polygon'
+            WHEN f.chain = 'Optimism'  THEN 'optimism'
+            WHEN f.chain = 'Base'      THEN 'base'
+            WHEN f.chain = 'Avalanche' THEN 'avalanche_c'
+        END
+    GROUP BY f.chain, f.day
+)
+
+SELECT
+    chain,
+    day,
+    net_flow_usd,
+    SUM(net_flow_usd) OVER (PARTITION BY chain ORDER BY day) AS cumulative_tvl_usd
+FROM daily_net
+ORDER BY day, chain

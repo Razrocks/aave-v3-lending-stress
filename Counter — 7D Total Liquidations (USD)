@@ -1,0 +1,13 @@
+SELECT
+    COALESCE(SUM(
+        CAST(l.debtToCover AS DOUBLE) / POWER(10, t.decimals) * p.price
+    ), 0) AS liquidations_usd_7d
+FROM aave_v3_ethereum.Pool_evt_LiquidationCall l
+LEFT JOIN tokens.erc20 t
+    ON t.blockchain = 'ethereum'
+    AND t.contract_address = l.debtAsset
+LEFT JOIN prices.day p
+    ON p.blockchain = 'ethereum'
+    AND p.contract_address = l.debtAsset
+    AND p.timestamp = DATE_TRUNC('day', l.evt_block_time)
+WHERE l.evt_block_time >= NOW() - INTERVAL '7' DAY

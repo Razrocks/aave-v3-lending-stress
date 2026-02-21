@@ -1,0 +1,44 @@
+WITH daily_borrow AS (
+    SELECT
+        DATE_TRUNC('day', b.evt_block_time)                              AS day,
+        SUM(CAST(b.amount AS DOUBLE) / POWER(10, t.decimals) * p.price)  AS borrow_usd
+    FROM aave_v3_ethereum.Pool_evt_Borrow b
+    LEFT JOIN tokens.erc20 t
+        ON t.blockchain = 'ethereum'
+        AND t.contract_address = b.reserve
+    LEFT JOIN prices.day p
+        ON p.blockchain = 'ethereum'
+        AND p.contract_address = b.reserve
+        AND p.timestamp = DATE_TRUNC('day', b.evt_block_time)
+    WHERE b.evt_block_time >= NOW() - INTERVAL '30' DAY
+    GROUP BY 1
+),
+
+borrow_rolling AS (
+    SELECT
+        day,
+        SUM(borrow_usd) OVER (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)   AS borrow_7d,
+        SUM(borrow_usd) OVER (ORDER BY day ROWS BETWEEN 13 PRECEDING AND 7 PRECEDING)  AS borrow_prev_7d
+    FROM daily_borrow
+),
+
+latest AS (
+    SELECT
+        day,
+        CASE
+            WHEN borrow_prev_7d > 0
+            THEN (borrow_7d - borrow_prev_7d) / borrow_prev_7d
+            ELSE 0
+        END AS borrow_growth_7d,
+        borrow_7d
+    FROM borrow_rolling
+    ORDER BY day DESC
+    LIMIT 1
+)
+
+SELECT
+    day                                                                      AS latest_day,
+    ROUND(borrow_growth_7d * 100, 1)                                         AS borrow_growth_pct,
+    ROUND(borrow_7d, 0)                                                      AS borrow_7d_usd,
+    CASE WHEN borrow_growth_7d > 0.1 THEN 'ELEVATED' ELSE 'NORMAL' END      AS status
+FROM latest
